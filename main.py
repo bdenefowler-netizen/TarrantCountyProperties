@@ -27,7 +27,7 @@ def _fingerprint(data: bytes) -> str:
 
 def run():
     st.title("Tarrant County Property Research")
-    st.caption("v2.1 • Local TAD bulk matching • Foreclosure research • Excel export")
+    st.caption("v2.2 • Local TAD bulk matching • Excel/ZIP support • Foreclosure research • Excel export")
     research_tab, results_tab, help_tab, privacy_tab = st.tabs(["Research", "Results", "Help", "Privacy"])
 
     with research_tab:
@@ -38,7 +38,7 @@ def run():
             help="Uses the original county columns or the cleaned workbook aliases.",
         )
         if not lead_file:
-            st.info("Start with the foreclosure/distress workbook, then add TAD's bulk ZIP/TXT file.")
+            st.info("Start with the foreclosure/distress workbook, then add TAD bulk property data.")
             return
 
         valid, message = core.validate_upload(lead_file)
@@ -63,14 +63,14 @@ def run():
 
         st.subheader("2. Add TAD bulk property data")
         st.caption(
-            "Upload PropertyData(Delimited).ZIP directly. The importer streams the pipe-delimited TXT in chunks and "
-            "keeps only candidate rows sharing house numbers with your leads, so the 2+ million-row TAD file does not "
-            "need to live in memory."
+            "Upload TAD TXT, CSV, XLSX, or ZIP files. ZIP archives may contain TXT, CSV, or XLSX data. "
+            "Large pipe-delimited property files are streamed in chunks and only candidate rows sharing house numbers "
+            "with your leads are kept in memory."
         )
         tad_file = st.file_uploader(
             "TAD property data",
             type=["zip", "txt", "csv", "xlsx"],
-            help=f"Supports the official TAD ZIP/TXT export up to {MAX_TAD_UPLOAD_MB} MB.",
+            help=f"Supports TAD TXT, CSV, Excel, and ZIP archives containing those formats up to {MAX_TAD_UPLOAD_MB} MB.",
         )
 
         tad_index = None
@@ -84,7 +84,7 @@ def run():
                 source_name = cached["source"]
             else:
                 try:
-                    with st.spinner("Streaming TAD data and building a lead-specific property index..."):
+                    with st.spinner("Loading TAD data and building a lead-specific property index..."):
                         tad_df, source_name = load_tad_dataframe(tad_file, addresses, MAX_TAD_UPLOAD_MB)
                         tad_index = BulkTADIndex(tad_df)
                     st.session_state["bulk_tad_cache"] = {"key": key, "index": tad_index, "source": source_name}
@@ -132,14 +132,15 @@ def run():
         st.markdown(
             """
 1. Upload the foreclosure/distress `.xlsx` file.
-2. Upload TAD's `PropertyData(Delimited).ZIP` (or its TXT directly).
-3. Start research.
-4. Review fuzzy/uncertain matches before relying on them.
-5. Export the enriched Excel workbook.
+2. Upload TAD property data as `.txt`, `.csv`, `.xlsx`, or `.zip`.
+3. ZIP files may contain a TAD TXT/CSV property export or an Excel workbook such as Residential Comp Attribute data.
+4. Start research.
+5. Review fuzzy/uncertain matches before relying on them.
+6. Export the enriched Excel workbook.
+
+The importer recognizes TAD account identifiers such as `Account_Num`, `Account Number`, `APN`, and `PIN`, plus common situs-address column variations.
 
 The bulk TAD file is the primary property source. PubRecord remains a manual fallback. The app does not bulk-scrape PubRecord.
-
-The Residential Comp Attribute and Improvement Details workbooks will be added as a second enrichment pass after the core ZIP/TXT pipeline is stable on the hosted app.
 """
         )
         core.render_help()
