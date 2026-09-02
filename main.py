@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -11,6 +12,7 @@ from lib.tad_bulk import BulkTADIndex, load_tad_dataframe, make_bulk_source_clas
 CORE_PATH = Path(__file__).parent / "artifacts" / "tarrant-property-research" / "app.py"
 spec = importlib.util.spec_from_file_location("tarrant_core", CORE_PATH)
 core = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = core
 spec.loader.exec_module(core)
 
 core._ORIGINAL_TAD_PROPERTY_SOURCE = core.TADPropertySource
