@@ -3,6 +3,7 @@ modules = ["nodejs-24", "python-base-3.13"]
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
+run = "streamlit run --server.address 0.0.0.0 --server.headless true --server.enableCORS=false --server.enableWebsocketCompression=false app.py"
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
