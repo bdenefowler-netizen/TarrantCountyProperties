@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Tarrant County Property Research"
+description = "A Python Streamlit web app for enriching Tarrant County property workbooks with public-record research, match confidence, review flags, and Excel export."
+version = "1.0.0"
+id = "artifacts/tarrant-property-research"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20420
+
+[services.development]
+run = "uv run streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS=false --server.enableWebsocketCompression=false"
+
+[services.production.build]
+args = ["uv", "sync", "--frozen"]
+
+[services.production.run]
+args = ["uv", "run", "--frozen", "streamlit", "run", "app.py", "--server.port", "20420", "--server.address", "0.0.0.0", "--server.headless", "true", "--server.enableCORS", "false", "--server.enableWebsocketCompression", "false"]
+
+[services.production.run.env]
+PORT = "20420"
+
+[services.env]
+PORT = "20420"
+BASE_PATH = "/"

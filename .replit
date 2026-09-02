@@ -10,7 +10,7 @@ args = ["pnpm", "store", "prune"]
 env = { "CI" = "true" }
 
 [workflows]
-runButton = "Tarrant property research"
+runButton = "Project"
 
 [[workflows.workflow]]
 name = "Project"
