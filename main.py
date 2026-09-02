@@ -5,6 +5,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from lib.tad_bulk import BulkTADIndex, load_tad_dataframe, make_bulk_source_class, target_house_numbers
@@ -25,9 +26,18 @@ def _fingerprint(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _combined_upload_key(files, addresses: list[str]) -> str:
+    file_parts = []
+    for uploaded in files:
+        raw = uploaded.getvalue()
+        file_parts.append(f"{uploaded.name}:{_fingerprint(raw)}")
+    houses = ",".join(sorted(target_house_numbers(addresses)))
+    return "|".join(file_parts) + ":houses:" + hashlib.sha256(houses.encode("utf-8")).hexdigest()
+
+
 def run():
     st.title("Tarrant County Property Research")
-    st.caption("v2.2 • Local TAD bulk matching • Excel/ZIP support • Foreclosure research • Excel export")
+    st.caption("v2.3 • Multi-file TAD merge • Local bulk matching • Foreclosure research • Excel export")
     research_tab, results_tab, help_tab, privacy_tab = st.tabs(["Research", "Results", "Help", "Privacy"])
 
     with research_tab:
@@ -38,7 +48,7 @@ def run():
             help="Uses the original county columns or the cleaned workbook aliases.",
         )
         if not lead_file:
-            st.info("Start with the foreclosure/distress workbook, then add TAD bulk property data.")
+            st.info("Start with the foreclosure/distress workbook, then add one or more TAD data files.")
             return
 
         valid, message = core.validate_upload(lead_file)
@@ -61,43 +71,83 @@ def run():
         addresses = df[address_col].fillna("").astype(str).tolist()
         st.dataframe(df.head(75), use_container_width=True, hide_index=True)
 
-        st.subheader("2. Add TAD bulk property data")
+        st.subheader("2. Add TAD property data")
         st.caption(
-            "Upload TAD TXT, CSV, XLSX, or ZIP files. ZIP archives may contain TXT, CSV, or XLSX data. "
-            "Large pipe-delimited property files are streamed in chunks and only candidate rows sharing house numbers "
-            "with your leads are kept in memory."
+            "Upload multiple TAD TXT, CSV, XLSX, or ZIP files together. All selected files are loaded, filtered to your lead addresses, "
+            "then combined into one property index. Large pipe-delimited property files are streamed in chunks so the full county file "
+            "does not need to live in memory."
         )
-        tad_file = st.file_uploader(
-            "TAD property data",
+        tad_files = st.file_uploader(
+            "TAD property data files",
             type=["zip", "txt", "csv", "xlsx"],
-            help=f"Supports TAD TXT, CSV, Excel, and ZIP archives containing those formats up to {MAX_TAD_UPLOAD_MB} MB.",
+            accept_multiple_files=True,
+            help=f"Select one or more TAD files. Each individual upload may be up to {MAX_TAD_UPLOAD_MB} MB.",
         )
 
         tad_index = None
-        source_name = ""
-        if tad_file:
-            raw = tad_file.getvalue()
-            key = _fingerprint(raw) + ":" + str(hash(tuple(sorted(target_house_numbers(addresses)))))
+        source_names: list[str] = []
+        if tad_files:
+            key = _combined_upload_key(tad_files, addresses)
             cached = st.session_state.get("bulk_tad_cache")
             if cached and cached.get("key") == key:
                 tad_index = cached["index"]
-                source_name = cached["source"]
+                source_names = cached.get("sources", [])
             else:
-                try:
-                    with st.spinner("Loading TAD data and building a lead-specific property index..."):
+                frames: list[pd.DataFrame] = []
+                errors: list[str] = []
+                progress = st.progress(0)
+                status = st.empty()
+
+                for position, tad_file in enumerate(tad_files, start=1):
+                    status.caption(f"Loading {position} of {len(tad_files)}: {tad_file.name}")
+                    try:
                         tad_df, source_name = load_tad_dataframe(tad_file, addresses, MAX_TAD_UPLOAD_MB)
-                        tad_index = BulkTADIndex(tad_df)
-                    st.session_state["bulk_tad_cache"] = {"key": key, "index": tad_index, "source": source_name}
-                except Exception as exc:
-                    st.error(f"Unable to load TAD bulk data: {exc}")
+                        if not tad_df.empty:
+                            frames.append(tad_df)
+                        source_names.append(source_name)
+                    except Exception as exc:
+                        errors.append(f"{tad_file.name}: {exc}")
+                    progress.progress(position / max(len(tad_files), 1))
+
+                if errors:
+                    st.warning("Some files could not be loaded:\n\n" + "\n".join(f"• {message}" for message in errors))
+
+                if not frames:
+                    st.error("None of the selected TAD files produced usable property rows.")
                     return
-            st.success(f"TAD ready: {len(tad_index.working):,} candidate rows from {source_name}")
+
+                with st.spinner("Combining all TAD sources into one property index..."):
+                    combined = pd.concat(frames, ignore_index=True, sort=False)
+                    account_candidates = [c for c in combined.columns if str(c).strip().lower().replace("_", " ") in {
+                        "account num", "account number", "account", "apn", "pin", "parcel id", "property id"
+                    }]
+                    if account_candidates:
+                        account_col = account_candidates[0]
+                        combined = combined.drop_duplicates(subset=[account_col], keep="first")
+                    else:
+                        combined = combined.drop_duplicates(keep="first")
+                    tad_index = BulkTADIndex(combined)
+
+                st.session_state["bulk_tad_cache"] = {
+                    "key": key,
+                    "index": tad_index,
+                    "sources": source_names,
+                }
+                progress.empty()
+                status.empty()
+
+            st.success(
+                f"Combined TAD index ready: {len(tad_index.working):,} candidate property rows from {len(source_names):,} file(s)."
+            )
+            with st.expander("Loaded TAD sources"):
+                for source in source_names:
+                    st.write(f"• {source}")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Lead rows", f"{len(df):,}")
         c2.metric("Street-number groups", f"{len(target_house_numbers(addresses)):,}")
         c3.metric("TAD candidates", f"{len(tad_index.working):,}" if tad_index else "0")
-        c4.metric("TAD source", "Loaded" if tad_index else "Not loaded")
+        c4.metric("TAD files", f"{len(source_names):,}" if tad_index else "0")
 
         if not tad_index:
             st.warning("Research can run without TAD bulk data, but automatic owner/property enrichment will be limited.")
@@ -112,7 +162,7 @@ def run():
 
             enriched = core.research_dataframe(df, progress_callback=update_progress, tad_index=tad_index)
             st.session_state["results"] = enriched
-            st.session_state["tad_source_name"] = source_name
+            st.session_state["tad_source_names"] = source_names
             progress.progress(1.0)
             status.success(f"Research complete for {len(enriched):,} properties.")
             st.rerun()
@@ -122,9 +172,9 @@ def run():
         if results is None:
             st.info("Run research first.")
         else:
-            source = st.session_state.get("tad_source_name", "")
-            if source:
-                st.caption(f"TAD bulk source: {source}")
+            sources = st.session_state.get("tad_source_names", [])
+            if sources:
+                st.caption(f"TAD sources combined: {len(sources)}")
             core.render_results(results)
 
     with help_tab:
@@ -132,15 +182,18 @@ def run():
         st.markdown(
             """
 1. Upload the foreclosure/distress `.xlsx` file.
-2. Upload TAD property data as `.txt`, `.csv`, `.xlsx`, or `.zip`.
-3. ZIP files may contain a TAD TXT/CSV property export or an Excel workbook such as Residential Comp Attribute data.
-4. Start research.
-5. Review fuzzy/uncertain matches before relying on them.
-6. Export the enriched Excel workbook.
+2. Select **all** TAD files you want to use at the same time: `.txt`, `.csv`, `.xlsx`, and/or `.zip`.
+3. ZIP files may contain TAD TXT/CSV property exports or Excel workbooks.
+4. The app filters each source to candidate properties, then merges the results into one combined TAD index.
+5. Start research.
+6. Review fuzzy/uncertain matches before relying on them.
+7. Export the enriched Excel workbook.
+
+Adding multiple files does **not** intentionally overwrite the prior source. All files selected in the uploader are combined for that research run.
 
 The importer recognizes TAD account identifiers such as `Account_Num`, `Account Number`, `APN`, and `PIN`, plus common situs-address column variations.
 
-The bulk TAD file is the primary property source. PubRecord remains a manual fallback. The app does not bulk-scrape PubRecord.
+The bulk TAD data is the primary property source. PubRecord remains a manual fallback. The app does not bulk-scrape PubRecord.
 """
         )
         core.render_help()
