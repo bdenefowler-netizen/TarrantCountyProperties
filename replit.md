@@ -1,10 +1,11 @@
-# [Project name]
+# Tarrant County Property Research
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Streamlit website that enriches Tarrant County property workbooks with public-record research and exports the results as Excel.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `streamlit run app.py --server.port 5000` — run the property research website
+- `pnpm --filter @workspace/api-server run dev` — run the shared API server
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
@@ -22,15 +23,22 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `app.py` — Streamlit application and property research engine
+- `pyproject.toml` / `uv.lock` — Python dependencies and lockfile
+- `attached_assets/` — original uploaded source file
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- The uploaded Streamlit application is kept as the primary website entry point.
+- TAD enrichment uses official property PDFs after resolving an account number; it does not depend on an undocumented search endpoint.
+- PubRecord remains a manual-review link only, respecting its stated search limits.
+- Uploaded workbooks are processed in the running session and can be downloaded as enriched Excel.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Upload an `.xlsx` property or foreclosure workbook.
+- Optionally upload a public TAD CSV/XLSX address-to-account index.
+- Validate recognized headers, enrich rows, review match confidence and missing data, and export the completed workbook.
 
 ## User preferences
 
