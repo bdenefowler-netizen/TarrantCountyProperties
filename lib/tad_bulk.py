@@ -60,6 +60,28 @@ def target_house_numbers(addresses: list[str]) -> set[str]:
     return out
 
 
+def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    names = {re.sub(r"[\s_]+", "", str(c).strip().lower()): c for c in df.columns}
+    for candidate in candidates:
+        key = re.sub(r"[\s_]+", "", candidate.strip().lower())
+        if key in names:
+            return names[key]
+    return None
+
+
+def _filter_to_target_houses(df: pd.DataFrame, targets: set[str]) -> pd.DataFrame:
+    if df.empty or not targets:
+        return df
+    address_col = _find_column(
+        df,
+        ["Situs_Address", "Situs Address", "SitusAddress", "Property Address", "Address", "Site Address"],
+    )
+    if not address_col:
+        return df
+    house = df[address_col].fillna("").astype(str).str.extract(r"^\s*(\d+)", expand=False)
+    return df[house.isin(targets)].copy()
+
+
 def _read_pipe(stream, targets: set[str]) -> pd.DataFrame:
     pieces: list[pd.DataFrame] = []
     wanted = set(TAD_BULK_COLUMNS)
@@ -84,6 +106,11 @@ def _read_pipe(stream, targets: set[str]) -> pd.DataFrame:
     return pd.concat(pieces, ignore_index=True)
 
 
+def _read_excel(raw_or_stream, targets: set[str]) -> pd.DataFrame:
+    df = pd.read_excel(raw_or_stream, engine="openpyxl", dtype=object)
+    return _filter_to_target_houses(df, targets)
+
+
 def load_tad_dataframe(uploaded_file, target_addresses: list[str], max_mb: int = 200) -> tuple[pd.DataFrame, str]:
     raw = uploaded_file.getvalue()
     size_mb = len(raw) / 1024 / 1024
@@ -92,33 +119,57 @@ def load_tad_dataframe(uploaded_file, target_addresses: list[str], max_mb: int =
     name = uploaded_file.name
     lower = name.lower()
     targets = target_house_numbers(target_addresses)
+
     if lower.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            members = [x for x in zf.infolist() if x.filename.lower().endswith((".txt", ".csv"))]
+            supported = (".txt", ".csv", ".xlsx")
+            members = [x for x in zf.infolist() if x.filename.lower().endswith(supported)]
             if not members:
-                raise ValueError("ZIP does not contain a TXT/CSV property file.")
+                raise ValueError("ZIP does not contain a supported TXT, CSV, or XLSX property file.")
+
+            # Prefer the largest property-like member. This works for official bulk exports
+            # and also for ZIPs containing a single Residential Excel workbook.
             member = max(members, key=lambda x: x.file_size)
+            member_lower = member.filename.lower()
             with zf.open(member) as stream:
-                return _read_pipe(stream, targets), f"{name} → {member.filename}"
+                if member_lower.endswith(".xlsx"):
+                    data = _read_excel(io.BytesIO(stream.read()), targets)
+                elif member_lower.endswith(".csv"):
+                    data = pd.read_csv(stream, dtype=str, low_memory=False)
+                    data = _filter_to_target_houses(data, targets)
+                else:
+                    data = _read_pipe(stream, targets)
+            return data, f"{name} → {member.filename}"
+
     if lower.endswith(".txt"):
         return _read_pipe(io.BytesIO(raw), targets), name
     if lower.endswith(".csv"):
-        return pd.read_csv(io.BytesIO(raw), dtype=str, low_memory=False), name
+        df = pd.read_csv(io.BytesIO(raw), dtype=str, low_memory=False)
+        return _filter_to_target_houses(df, targets), name
     if lower.endswith(".xlsx"):
-        return pd.read_excel(io.BytesIO(raw), engine="openpyxl", dtype=object), name
+        return _read_excel(io.BytesIO(raw), targets), name
     raise ValueError("TAD data must be ZIP, TXT, CSV, or XLSX.")
 
 
 class BulkTADIndex:
-    ADDRESS_CANDIDATES = ["Situs_Address", "Situs Address", "Property Address", "Address", "SITUS_ADDRESS"]
-    ACCOUNT_CANDIDATES = ["Account_Num", "Account Number", "Account", "APN", "ACCOUNT_NUM"]
+    ADDRESS_CANDIDATES = [
+        "Situs_Address", "Situs Address", "SitusAddress", "Property Address",
+        "Address", "Site Address", "SITUS_ADDRESS",
+    ]
+    ACCOUNT_CANDIDATES = [
+        "Account_Num", "Account Number", "Account", "APN", "ACCOUNT_NUM",
+        "PIN", "Pin", "Parcel ID", "Property ID",
+    ]
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self.address_col = self._find(self.ADDRESS_CANDIDATES)
         self.account_col = self._find(self.ACCOUNT_CANDIDATES)
         if not self.address_col or not self.account_col:
-            raise ValueError("Could not identify TAD situs-address/account columns.")
+            raise ValueError(
+                "Could not identify TAD situs-address/account columns. "
+                "Expected an address field such as Situs Address and an account field such as Account_Num or PIN."
+            )
         working = self.df.dropna(subset=[self.address_col, self.account_col]).copy()
         working["__norm"] = working[self.address_col].map(normalize_address)
         working["__house"] = working["__norm"].str.extract(r"^(\d+)", expand=False).fillna("")
@@ -134,10 +185,11 @@ class BulkTADIndex:
             self.by_account.setdefault(row["__account"], i)
 
     def _find(self, candidates: list[str]) -> Optional[str]:
-        names = {str(c).strip().lower(): c for c in self.df.columns}
+        names = {re.sub(r"[\s_]+", "", str(c).strip().lower()): c for c in self.df.columns}
         for candidate in candidates:
-            if candidate.lower() in names:
-                return names[candidate.lower()]
+            key = re.sub(r"[\s_]+", "", candidate.strip().lower())
+            if key in names:
+                return names[key]
         return None
 
     def lookup(self, address: str) -> tuple[str, str, float]:
@@ -201,42 +253,54 @@ def yes_no(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _first(record: dict[str, Any], *keys: str) -> Any:
+    normalized = {re.sub(r"[\s_]+", "", str(k).lower()): v for k, v in record.items()}
+    for key in keys:
+        value = normalized.get(re.sub(r"[\s_]+", "", key.lower()))
+        if value not in (None, "") and not (isinstance(value, float) and pd.isna(value)):
+            return value
+    return ""
+
+
 def map_record(record: dict[str, Any], pdf_template: str) -> dict[str, Any]:
-    account = canonical_account(record.get("Account_Num"))
+    account = canonical_account(_first(record, "Account_Num", "PIN", "Account Number", "APN"))
     owner_mail = " ".join(
-        str(record.get(k) or "").strip()
+        str(_first(record, k) or "").strip()
         for k in ("Owner_Address", "Owner_CityState", "Owner_Zip")
-        if str(record.get(k) or "").strip()
+        if str(_first(record, k) or "").strip()
     )
     out = {
-        "Matched Address": record.get("Situs_Address", ""),
+        "Matched Address": _first(record, "Situs_Address", "Situs Address", "SitusAddress", "Property Address"),
         "Tax Account/APN": account,
         "TAD Account Number": account,
-        "Current Owner": record.get("Owner_Name", ""),
+        "Current Owner": _first(record, "Owner_Name", "Owner Name", "Owner"),
         "TAD Owner Mailing Address": owner_mail,
-        "Land Use Code": record.get("State_Use_Code", ""),
-        "Land Use Category": record.get("Property_Class", ""),
-        "Legal Description": record.get("LegalDescription", ""),
-        "TAD Deed Date": record.get("Deed_Date", ""),
-        "Latest Recording Date": record.get("Deed_Date", ""),
-        "TAD Instrument Number": record.get("Instrument_No", ""),
-        "Latest Document ID": record.get("Instrument_No", ""),
-        "Land Value": parse_money(record.get("Land_Value")),
-        "Improvement Value": parse_money(record.get("Improvement_Value")),
-        "Total Assessed Value": parse_money(record.get("Total_Value")),
-        "Market Value": parse_money(record.get("Appraised_Value")) or parse_money(record.get("Total_Value")),
-        "Parking": record.get("Garage_Capacity", ""),
-        "Bedrooms": record.get("Num_Bedrooms", ""),
-        "Bathrooms": record.get("Num_Bathrooms", ""),
-        "Year Built": record.get("Year_Built", ""),
-        "Total Structure Area": parse_money(record.get("Living_Area")) or parse_money(record.get("Gross_Building_Area")),
-        "Pool": yes_no(record.get("Swimming_Pool_Ind")),
-        "Lot Acres": record.get("Land_Acres", ""),
-        "Lot Area Sq Ft": parse_money(record.get("Land_SqFt")),
-        "Heating": yes_no(record.get("Central_Heat_Ind")),
-        "Air Conditioning": yes_no(record.get("Central_Air_Ind")),
-        "Units": record.get("Structure_Count", ""),
-        "Current Tax Year": record.get("Appraisal_Year", ""),
+        "Land Use Code": _first(record, "State_Use_Code", "State Use Code"),
+        "Land Use Category": _first(record, "Property_Class", "Property Class", "Improvement Type", "Style"),
+        "Legal Description": _first(record, "LegalDescription", "Legal Description"),
+        "TAD Deed Date": _first(record, "Deed_Date", "Deed Date"),
+        "Latest Recording Date": _first(record, "Deed_Date", "Deed Date"),
+        "TAD Instrument Number": _first(record, "Instrument_No", "Instrument Number"),
+        "Latest Document ID": _first(record, "Instrument_No", "Instrument Number"),
+        "Land Value": parse_money(_first(record, "Land_Value", "Land Value")),
+        "Improvement Value": parse_money(_first(record, "Improvement_Value", "Improvement Value")),
+        "Total Assessed Value": parse_money(_first(record, "Total_Value", "Total Value", "Equity Indicated Value")),
+        "Market Value": parse_money(_first(record, "Appraised_Value", "Market Indicated Value", "Total_Value", "Total Value")),
+        "Parking": _first(record, "Garage_Capacity", "Garage Capacity", "Garage"),
+        "Bedrooms": _first(record, "Num_Bedrooms", "Bedrooms"),
+        "Bathrooms": _first(record, "Num_Bathrooms", "Bathrooms"),
+        "Year Built": _first(record, "Year_Built", "Actual Year Built", "Year Built"),
+        "Year Updated": _first(record, "Effective Year Built", "Effective_Year_Built"),
+        "Total Structure Area": parse_money(_first(record, "Living_Area", "Main Area", "Gross_Building_Area", "Gross Building Area")),
+        "Pool": yes_no(_first(record, "Swimming_Pool_Ind", "Pool", "Pool Indicator")),
+        "Lot Acres": _first(record, "Land_Acres", "Land Acres", "Acreage"),
+        "Lot Area Sq Ft": parse_money(_first(record, "Land_SqFt", "Land Sq Ft", "Land Area")),
+        "Heating": yes_no(_first(record, "Central_Heat_Ind", "Central Heat")),
+        "Air Conditioning": yes_no(_first(record, "Central_Air_Ind", "Central Air")),
+        "Units": _first(record, "Structure_Count", "Structure Count"),
+        "Structure Quality": _first(record, "Quality"),
+        "Structure Condition": _first(record, "Condition"),
+        "Current Tax Year": _first(record, "Appraisal_Year", "Appraisal Year"),
         "TAD Verified": "YES" if account else "REVIEW",
         "TAD Property URL": pdf_template.format(account=account) if account else "",
         "County": "Tarrant",
