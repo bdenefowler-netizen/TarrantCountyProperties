@@ -36,9 +36,43 @@ def _combined_upload_key(files, addresses: list[str]) -> str:
     return "|".join(file_parts) + ":houses:" + hashlib.sha256(houses.encode("utf-8")).hexdigest()
 
 
+def _clean_foreclosure_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove report chrome while preserving actual foreclosure/legal-description rows."""
+    working = df.copy()
+    address_col = core.resolve_input_column(working, "Property Address")
+    addresses = working[address_col].fillna("").astype(str).str.strip()
+
+    # Real records in the county export always carry something in the Property
+    # Address field. Legal descriptions are also stored there, so they survive.
+    keep = addresses.ne("") & addresses.str.upper().ne("PROPERTY ADDRESS")
+
+    try:
+        grantor_col = core.resolve_input_column(working, "Grantor")
+    except Exception:
+        grantor_col = None
+
+    if grantor_col:
+        grantors = working[grantor_col].fillna("").astype(str).str.strip()
+        keep &= ~grantors.str.startswith("©")
+        keep &= grantors.str.upper().ne("GRANTOR")
+
+    cleaned = working.loc[keep].reset_index(drop=True)
+    removed = len(working) - len(cleaned)
+    return cleaned, removed
+
+
+def _tad_quick_check(tad_index: BulkTADIndex, addresses: list[str]):
+    matches = []
+    for address in addresses:
+        account, matched_address, score = tad_index.lookup(address)
+        if account:
+            matches.append((address, account, matched_address, score))
+    return matches
+
+
 def run():
     st.title("Tarrant County Property Research")
-    st.caption("v2.4 • Split-TXT streaming • Multi-file TAD merge • Foreclosure research • Excel export")
+    st.caption("v2.5 • Foreclosure cleanup • TAD match diagnostics • Split-TXT streaming • Excel export")
     research_tab, results_tab, help_tab, privacy_tab = st.tabs(["Research", "Results", "Help", "Privacy"])
 
     with research_tab:
@@ -68,6 +102,13 @@ def run():
             st.error("Missing required field(s): " + ", ".join(missing))
             return
 
+        df, removed_rows = _clean_foreclosure_rows(df)
+        if removed_rows:
+            st.info(
+                f"Cleaned county report: removed {removed_rows:,} page-header/footer/blank row(s); "
+                f"{len(df):,} foreclosure lead row(s) remain."
+            )
+
         address_col = core.resolve_input_column(df, "Property Address")
         addresses = df[address_col].fillna("").astype(str).tolist()
         st.dataframe(df.head(75), use_container_width=True, hide_index=True)
@@ -87,6 +128,7 @@ def run():
 
         tad_index = None
         source_names: list[str] = []
+        tad_matches = []
         if tad_files:
             key = _combined_upload_key(tad_files, addresses)
             cached = st.session_state.get("bulk_tad_cache")
@@ -130,9 +172,27 @@ def run():
                 progress.empty()
                 status.empty()
 
+            tad_matches = _tad_quick_check(tad_index, addresses)
             st.success(
                 f"Combined TAD index ready: {len(tad_index.working):,} candidate property rows from {len(source_names):,} source group(s)."
             )
+
+            if tad_matches:
+                st.success(
+                    f"TAD quick-check: {len(tad_matches):,} of {len(addresses):,} lead row(s) currently resolve to a TAD account before research."
+                )
+                with st.expander("Preview TAD matches"):
+                    preview = pd.DataFrame(
+                        tad_matches[:25],
+                        columns=["Lead Address", "TAD Account", "Matched Situs Address", "Score"],
+                    )
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+            else:
+                st.error(
+                    "TAD quick-check found ZERO lead-address matches. Do not start research yet; "
+                    "the uploaded property data/index still needs attention."
+                )
+
             with st.expander("Loaded TAD sources"):
                 for source in source_names:
                     st.write(f"• {source}")
@@ -141,7 +201,7 @@ def run():
         c1.metric("Lead rows", f"{len(df):,}")
         c2.metric("Street-number groups", f"{len(target_house_numbers(addresses)):,}")
         c3.metric("TAD candidates", f"{len(tad_index.working):,}" if tad_index else "0")
-        c4.metric("TAD sources", f"{len(source_names):,}" if tad_index else "0")
+        c4.metric("TAD matched leads", f"{len(tad_matches):,}" if tad_index else "0")
 
         if not tad_index:
             st.warning("Research can run without TAD bulk data, but automatic owner/property enrichment will be limited.")
@@ -175,13 +235,13 @@ def run():
         st.subheader("Bulk TAD workflow")
         st.markdown(
             """
-1. Upload the foreclosure/distress `.xlsx` file.
+1. Upload the foreclosure/distress `.xlsx` file. County report headers, footers, blank rows, and repeated column headings are removed automatically.
 2. Select **all** TAD files you want to use at the same time: `.txt`, `.csv`, `.xlsx`, and/or `.zip`.
 3. For split county files, upload **every ZIP containing the related `.txt.partN` pieces together**.
 4. The app sorts split parts numerically, stitches rows across part boundaries, filters to candidate lead addresses, and builds one TAD index.
-5. Regular TAD ZIP/TXT/CSV/XLSX files are still supported and can be combined with the split dataset.
-6. Start research.
-7. Review fuzzy/uncertain matches before relying on them, then export the enriched workbook.
+5. Check the **TAD quick-check** before starting research. If it says zero matches, stop there rather than producing an empty export.
+6. Regular TAD ZIP/TXT/CSV/XLSX files are still supported and can be combined with the split dataset.
+7. Start research, review uncertain matches, then export the enriched workbook.
 
 Adding multiple files does **not** intentionally overwrite the prior source. All files selected in the uploader are combined for that research run.
 
