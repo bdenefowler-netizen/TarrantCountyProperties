@@ -44,11 +44,42 @@ def normalize_address(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_legal(value: Any) -> str:
+    """Normalize county/TAD legal descriptions without turning them into street addresses."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).upper().strip()
+    # County foreclosure rows often append city/state after the legal description.
+    text = text.split(",", 1)[0]
+    replacements = {
+        r"\bBLOCK\b": "BLK",
+        r"\bSECTION\b": "SEC",
+        r"\bADDITION\b": "ADDN",
+        r"\bSUBDIVISION\b": "SUBD",
+    }
+    for pattern, replacement in replacements.items():
+        text = re.sub(pattern, replacement, text)
+    text = re.sub(r"[^A-Z0-9\s-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def looks_like_legal_description(value: Any) -> bool:
+    text = str(value or "").upper().strip()
+    return bool(re.search(r"\b(LOT|BLOCK|BLK|TRACT|ABSTRACT|SURVEY|ADDITION|SUBDIVISION|ESTATES?)\b", text))
+
+
 def address_score(query: str, candidate: str) -> float:
     q, c = normalize_address(query), normalize_address(candidate)
     if not q or not c:
         return 0.0
     return round(fuzz.ratio(q, c) * 0.55 + fuzz.token_set_ratio(q, c) * 0.45, 1)
+
+
+def legal_score(query: str, candidate: str) -> float:
+    q, c = normalize_legal(query), normalize_legal(candidate)
+    if not q or not c:
+        return 0.0
+    return round(fuzz.ratio(q, c) * 0.35 + fuzz.token_set_ratio(q, c) * 0.65, 1)
 
 
 def target_house_numbers(addresses: list[str]) -> set[str]:
@@ -60,6 +91,14 @@ def target_house_numbers(addresses: list[str]) -> set[str]:
     return out
 
 
+def target_legal_descriptions(addresses: list[str]) -> set[str]:
+    return {
+        normalize_legal(value)
+        for value in addresses
+        if looks_like_legal_description(value) and normalize_legal(value)
+    }
+
+
 def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     names = {re.sub(r"[\s_]+", "", str(c).strip().lower()): c for c in df.columns}
     for candidate in candidates:
@@ -69,20 +108,28 @@ def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     return None
 
 
-def _filter_to_target_houses(df: pd.DataFrame, targets: set[str]) -> pd.DataFrame:
-    if df.empty or not targets:
+def _filter_to_targets(df: pd.DataFrame, house_targets: set[str], legal_targets: set[str]) -> pd.DataFrame:
+    if df.empty or (not house_targets and not legal_targets):
         return df
+
+    keep = pd.Series(False, index=df.index)
     address_col = _find_column(
         df,
         ["Situs_Address", "Situs Address", "SitusAddress", "Property Address", "Address", "Site Address"],
     )
-    if not address_col:
-        return df
-    house = df[address_col].fillna("").astype(str).str.extract(r"^\s*(\d+)", expand=False)
-    return df[house.isin(targets)].copy()
+    if address_col and house_targets:
+        house = df[address_col].fillna("").astype(str).str.extract(r"^\s*(\d+)", expand=False)
+        keep |= house.isin(house_targets)
+
+    legal_col = _find_column(df, ["LegalDescription", "Legal Description", "Legal_Description", "LEGAL_DESCRIPTION"])
+    if legal_col and legal_targets:
+        legal_norm = df[legal_col].fillna("").astype(str).map(normalize_legal)
+        keep |= legal_norm.isin(legal_targets)
+
+    return df.loc[keep].copy()
 
 
-def _read_pipe(stream, targets: set[str]) -> pd.DataFrame:
+def _read_pipe(stream, house_targets: set[str], legal_targets: set[str]) -> pd.DataFrame:
     pieces: list[pd.DataFrame] = []
     wanted = set(TAD_BULK_COLUMNS)
     for chunk in pd.read_csv(
@@ -94,11 +141,9 @@ def _read_pipe(stream, targets: set[str]) -> pd.DataFrame:
         low_memory=False,
         on_bad_lines="skip",
     ):
-        if "Situs_Address" not in chunk.columns:
-            raise ValueError("TAD property file does not contain Situs_Address.")
-        if targets:
-            house = chunk["Situs_Address"].fillna("").str.extract(r"^\s*(\d+)", expand=False)
-            chunk = chunk[house.isin(targets)]
+        if "Situs_Address" not in chunk.columns and "LegalDescription" not in chunk.columns:
+            raise ValueError("TAD property file does not contain Situs_Address or LegalDescription.")
+        chunk = _filter_to_targets(chunk, house_targets, legal_targets)
         if not chunk.empty:
             pieces.append(chunk)
     if not pieces:
@@ -106,9 +151,9 @@ def _read_pipe(stream, targets: set[str]) -> pd.DataFrame:
     return pd.concat(pieces, ignore_index=True)
 
 
-def _read_excel(raw_or_stream, targets: set[str]) -> pd.DataFrame:
+def _read_excel(raw_or_stream, house_targets: set[str], legal_targets: set[str]) -> pd.DataFrame:
     df = pd.read_excel(raw_or_stream, engine="openpyxl", dtype=object)
-    return _filter_to_target_houses(df, targets)
+    return _filter_to_targets(df, house_targets, legal_targets)
 
 
 def load_tad_dataframe(uploaded_file, target_addresses: list[str], max_mb: int = 200) -> tuple[pd.DataFrame, str]:
@@ -118,7 +163,8 @@ def load_tad_dataframe(uploaded_file, target_addresses: list[str], max_mb: int =
         raise ValueError(f"TAD upload is {size_mb:.1f} MB; maximum is {max_mb} MB.")
     name = uploaded_file.name
     lower = name.lower()
-    targets = target_house_numbers(target_addresses)
+    house_targets = target_house_numbers(target_addresses)
+    legal_targets = target_legal_descriptions(target_addresses)
 
     if lower.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -127,27 +173,25 @@ def load_tad_dataframe(uploaded_file, target_addresses: list[str], max_mb: int =
             if not members:
                 raise ValueError("ZIP does not contain a supported TXT, CSV, or XLSX property file.")
 
-            # Prefer the largest property-like member. This works for official bulk exports
-            # and also for ZIPs containing a single Residential Excel workbook.
             member = max(members, key=lambda x: x.file_size)
             member_lower = member.filename.lower()
             with zf.open(member) as stream:
                 if member_lower.endswith(".xlsx"):
-                    data = _read_excel(io.BytesIO(stream.read()), targets)
+                    data = _read_excel(io.BytesIO(stream.read()), house_targets, legal_targets)
                 elif member_lower.endswith(".csv"):
                     data = pd.read_csv(stream, dtype=str, low_memory=False)
-                    data = _filter_to_target_houses(data, targets)
+                    data = _filter_to_targets(data, house_targets, legal_targets)
                 else:
-                    data = _read_pipe(stream, targets)
+                    data = _read_pipe(stream, house_targets, legal_targets)
             return data, f"{name} → {member.filename}"
 
     if lower.endswith(".txt"):
-        return _read_pipe(io.BytesIO(raw), targets), name
+        return _read_pipe(io.BytesIO(raw), house_targets, legal_targets), name
     if lower.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(raw), dtype=str, low_memory=False)
-        return _filter_to_target_houses(df, targets), name
+        return _filter_to_targets(df, house_targets, legal_targets), name
     if lower.endswith(".xlsx"):
-        return _read_excel(io.BytesIO(raw), targets), name
+        return _read_excel(io.BytesIO(raw), house_targets, legal_targets), name
     raise ValueError("TAD data must be ZIP, TXT, CSV, or XLSX.")
 
 
@@ -155,6 +199,9 @@ class BulkTADIndex:
     ADDRESS_CANDIDATES = [
         "Situs_Address", "Situs Address", "SitusAddress", "Property Address",
         "Address", "Site Address", "SITUS_ADDRESS",
+    ]
+    LEGAL_CANDIDATES = [
+        "LegalDescription", "Legal Description", "Legal_Description", "LEGAL_DESCRIPTION",
     ]
     ACCOUNT_CANDIDATES = [
         "Account_Num", "Account Number", "Account", "APN", "ACCOUNT_NUM",
@@ -164,24 +211,42 @@ class BulkTADIndex:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self.address_col = self._find(self.ADDRESS_CANDIDATES)
+        self.legal_col = self._find(self.LEGAL_CANDIDATES)
         self.account_col = self._find(self.ACCOUNT_CANDIDATES)
-        if not self.address_col or not self.account_col:
+        if not self.account_col or (not self.address_col and not self.legal_col):
             raise ValueError(
-                "Could not identify TAD situs-address/account columns. "
-                "Expected an address field such as Situs Address and an account field such as Account_Num or PIN."
+                "Could not identify TAD account and property-location columns. "
+                "Expected Account_Num/PIN plus Situs_Address and/or LegalDescription."
             )
-        working = self.df.dropna(subset=[self.address_col, self.account_col]).copy()
-        working["__norm"] = working[self.address_col].map(normalize_address)
+
+        working = self.df.copy()
+        if self.address_col:
+            working["__norm"] = working[self.address_col].map(normalize_address)
+        else:
+            working["__norm"] = ""
+        if self.legal_col:
+            working["__legal_norm"] = working[self.legal_col].map(normalize_legal)
+        else:
+            working["__legal_norm"] = ""
         working["__house"] = working["__norm"].str.extract(r"^(\d+)", expand=False).fillna("")
         working["__account"] = working[self.account_col].map(canonical_account)
-        working = working[(working["__norm"] != "") & (working["__account"] != "")]
+        working = working[
+            (working["__account"] != "")
+            & ((working["__norm"] != "") | (working["__legal_norm"] != ""))
+        ]
         self.working = working.reset_index(drop=True)
+
         self.exact: dict[str, int] = {}
+        self.exact_legal: dict[str, int] = {}
         self.by_house: dict[str, list[int]] = {}
         self.by_account: dict[str, int] = {}
         for i, row in self.working.iterrows():
-            self.exact.setdefault(row["__norm"], i)
-            self.by_house.setdefault(row["__house"], []).append(i)
+            if row["__norm"]:
+                self.exact.setdefault(row["__norm"], i)
+            if row["__legal_norm"]:
+                self.exact_legal.setdefault(row["__legal_norm"], i)
+            if row["__house"]:
+                self.by_house.setdefault(row["__house"], []).append(i)
             self.by_account.setdefault(row["__account"], i)
 
     def _find(self, candidates: list[str]) -> Optional[str]:
@@ -192,32 +257,54 @@ class BulkTADIndex:
                 return names[key]
         return None
 
-    def lookup(self, address: str) -> tuple[str, str, float]:
-        q = normalize_address(address)
-        if not q:
-            return "", "", 0.0
-        exact_i = self.exact.get(q)
-        if exact_i is not None:
-            return (
-                str(self.working.at[exact_i, "__account"]),
-                str(self.working.at[exact_i, self.address_col]),
-                100.0,
-            )
-        m = re.match(r"^(\d+)", q)
-        house = m.group(1) if m else ""
-        idxs = self.by_house.get(house, [])
-        if not idxs:
-            return "", "", 0.0
-        choices = {i: self.working.at[i, "__norm"] for i in idxs}
-        hit = process.extractOne(q, choices, scorer=fuzz.token_set_ratio)
-        if not hit:
-            return "", "", 0.0
-        _, score, row_index = hit
+    def _result(self, row_index: int, score: float) -> tuple[str, str, float]:
+        matched_address = ""
+        if self.address_col:
+            matched_address = str(self.working.at[row_index, self.address_col] or "")
         return (
             str(self.working.at[row_index, "__account"]),
-            str(self.working.at[row_index, self.address_col]),
+            matched_address,
             float(score),
         )
+
+    def lookup(self, address_or_legal: str) -> tuple[str, str, float]:
+        q_address = normalize_address(address_or_legal)
+        q_legal = normalize_legal(address_or_legal)
+        if not q_address and not q_legal:
+            return "", "", 0.0
+
+        exact_i = self.exact.get(q_address)
+        if exact_i is not None:
+            return self._result(exact_i, 100.0)
+
+        exact_legal_i = self.exact_legal.get(q_legal)
+        if exact_legal_i is not None:
+            return self._result(exact_legal_i, 100.0)
+
+        m = re.match(r"^(\d+)", q_address)
+        house = m.group(1) if m else ""
+        idxs = self.by_house.get(house, []) if house else []
+        if idxs:
+            choices = {i: self.working.at[i, "__norm"] for i in idxs}
+            hit = process.extractOne(q_address, choices, scorer=fuzz.token_set_ratio)
+            if hit:
+                _, score, row_index = hit
+                if float(score) >= 72.0:
+                    return self._result(row_index, float(score))
+
+        if q_legal and looks_like_legal_description(address_or_legal):
+            choices = {
+                i: self.working.at[i, "__legal_norm"]
+                for i in self.working.index
+                if self.working.at[i, "__legal_norm"]
+            }
+            hit = process.extractOne(q_legal, choices, scorer=fuzz.token_set_ratio)
+            if hit:
+                _, score, row_index = hit
+                if float(score) >= 88.0:
+                    return self._result(row_index, float(score))
+
+        return "", "", 0.0
 
     def get_record(self, account: str) -> dict[str, Any]:
         i = self.by_account.get(canonical_account(account))
@@ -326,13 +413,15 @@ def make_bulk_source_class(core):
                     source=self.name,
                     query_address=address,
                     status="needs_account",
-                    note="No TAD account match was found in the uploaded bulk property data.",
+                    note="No TAD account match was found in the uploaded bulk property data by situs address or legal description.",
                 )
             record = self.tad_index.get_record(account) if self.tad_index is not None else {}
             if record:
                 data = map_record(record, core.TAD_PROPERTY_PDF_TEMPLATE)
                 candidate = data.get("Matched Address") or matched_address
-                score = address_score(address, candidate) if candidate else index_score
+                score = index_score
+                if candidate and not looks_like_legal_description(address):
+                    score = address_score(address, candidate)
                 return core.SourceResult(
                     source=self.name,
                     source_url=data.get("TAD Property URL", ""),
@@ -341,7 +430,7 @@ def make_bulk_source_class(core):
                     data=data,
                     confidence=score,
                     status="found",
-                    note="Matched directly from uploaded TAD bulk data.",
+                    note="Matched from uploaded TAD bulk data by situs address or legal description.",
                 )
             fallback = core._ORIGINAL_TAD_PROPERTY_SOURCE(tad_index=None)
             return fallback.search(address, account_hint=account)
