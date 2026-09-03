@@ -8,7 +8,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from lib.tad_bulk import BulkTADIndex, load_tad_dataframe, make_bulk_source_class, target_house_numbers
+from lib.tad_bulk import BulkTADIndex, make_bulk_source_class, target_house_numbers
+from lib.tad_multipart import load_tad_uploads
 
 CORE_PATH = Path(__file__).parent / "artifacts" / "tarrant-property-research" / "app.py"
 spec = importlib.util.spec_from_file_location("tarrant_core", CORE_PATH)
@@ -37,7 +38,7 @@ def _combined_upload_key(files, addresses: list[str]) -> str:
 
 def run():
     st.title("Tarrant County Property Research")
-    st.caption("v2.3 • Multi-file TAD merge • Local bulk matching • Foreclosure research • Excel export")
+    st.caption("v2.4 • Split-TXT streaming • Multi-file TAD merge • Foreclosure research • Excel export")
     research_tab, results_tab, help_tab, privacy_tab = st.tabs(["Research", "Results", "Help", "Privacy"])
 
     with research_tab:
@@ -73,15 +74,15 @@ def run():
 
         st.subheader("2. Add TAD property data")
         st.caption(
-            "Upload multiple TAD TXT, CSV, XLSX, or ZIP files together. All selected files are loaded, filtered to your lead addresses, "
-            "then combined into one property index. Large pipe-delimited property files are streamed in chunks so the full county file "
-            "does not need to live in memory."
+            "Upload multiple TAD TXT, CSV, XLSX, or ZIP files together. Split files named like "
+            "PropertyData(Delimited).txt.part1, .part2, etc. may be spread across multiple ZIP uploads; "
+            "the app stitches them together in numeric order while streaming and preserves rows split across part boundaries."
         )
         tad_files = st.file_uploader(
             "TAD property data files",
             type=["zip", "txt", "csv", "xlsx"],
             accept_multiple_files=True,
-            help=f"Select one or more TAD files. Each individual upload may be up to {MAX_TAD_UPLOAD_MB} MB.",
+            help=f"Select all related split ZIPs at the same time. Each individual upload may be up to {MAX_TAD_UPLOAD_MB} MB.",
         )
 
         tad_index = None
@@ -93,24 +94,16 @@ def run():
                 tad_index = cached["index"]
                 source_names = cached.get("sources", [])
             else:
-                frames: list[pd.DataFrame] = []
-                errors: list[str] = []
-                progress = st.progress(0)
                 status = st.empty()
+                progress = st.progress(0)
+                status.caption(f"Inspecting {len(tad_files)} TAD upload(s) and assembling split parts...")
+                progress.progress(0.15)
 
-                for position, tad_file in enumerate(tad_files, start=1):
-                    status.caption(f"Loading {position} of {len(tad_files)}: {tad_file.name}")
-                    try:
-                        tad_df, source_name = load_tad_dataframe(tad_file, addresses, MAX_TAD_UPLOAD_MB)
-                        if not tad_df.empty:
-                            frames.append(tad_df)
-                        source_names.append(source_name)
-                    except Exception as exc:
-                        errors.append(f"{tad_file.name}: {exc}")
-                    progress.progress(position / max(len(tad_files), 1))
+                frames, source_names, errors = load_tad_uploads(tad_files, addresses, MAX_TAD_UPLOAD_MB)
+                progress.progress(0.8)
 
                 if errors:
-                    st.warning("Some files could not be loaded:\n\n" + "\n".join(f"• {message}" for message in errors))
+                    st.warning("Some TAD data could not be loaded:\n\n" + "\n".join(f"• {message}" for message in errors))
 
                 if not frames:
                     st.error("None of the selected TAD files produced usable property rows.")
@@ -133,11 +126,12 @@ def run():
                     "index": tad_index,
                     "sources": source_names,
                 }
+                progress.progress(1.0)
                 progress.empty()
                 status.empty()
 
             st.success(
-                f"Combined TAD index ready: {len(tad_index.working):,} candidate property rows from {len(source_names):,} file(s)."
+                f"Combined TAD index ready: {len(tad_index.working):,} candidate property rows from {len(source_names):,} source group(s)."
             )
             with st.expander("Loaded TAD sources"):
                 for source in source_names:
@@ -147,7 +141,7 @@ def run():
         c1.metric("Lead rows", f"{len(df):,}")
         c2.metric("Street-number groups", f"{len(target_house_numbers(addresses)):,}")
         c3.metric("TAD candidates", f"{len(tad_index.working):,}" if tad_index else "0")
-        c4.metric("TAD files", f"{len(source_names):,}" if tad_index else "0")
+        c4.metric("TAD sources", f"{len(source_names):,}" if tad_index else "0")
 
         if not tad_index:
             st.warning("Research can run without TAD bulk data, but automatic owner/property enrichment will be limited.")
@@ -183,11 +177,11 @@ def run():
             """
 1. Upload the foreclosure/distress `.xlsx` file.
 2. Select **all** TAD files you want to use at the same time: `.txt`, `.csv`, `.xlsx`, and/or `.zip`.
-3. ZIP files may contain TAD TXT/CSV property exports or Excel workbooks.
-4. The app filters each source to candidate properties, then merges the results into one combined TAD index.
-5. Start research.
-6. Review fuzzy/uncertain matches before relying on them.
-7. Export the enriched Excel workbook.
+3. For split county files, upload **every ZIP containing the related `.txt.partN` pieces together**.
+4. The app sorts split parts numerically, stitches rows across part boundaries, filters to candidate lead addresses, and builds one TAD index.
+5. Regular TAD ZIP/TXT/CSV/XLSX files are still supported and can be combined with the split dataset.
+6. Start research.
+7. Review fuzzy/uncertain matches before relying on them, then export the enriched workbook.
 
 Adding multiple files does **not** intentionally overwrite the prior source. All files selected in the uploader are combined for that research run.
 
