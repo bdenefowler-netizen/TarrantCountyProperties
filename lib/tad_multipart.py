@@ -40,7 +40,6 @@ def _classify_columns(columns) -> str:
     improvement_markers = {
         "improvementdetail",
         "improvementdetaildescription",
-        "improvementvalue",
     }
     comp_markers = {
         "marketarea",
