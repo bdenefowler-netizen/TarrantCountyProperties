@@ -84,21 +84,58 @@ def _canonical_tad_account(value) -> str:
     return digits.zfill(8)
 
 
+def _norm_header(value) -> str:
+    text = str(value or "").strip().lower()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
 def _find_column(df: pd.DataFrame, candidates: set[str]):
-    normalized = {str(c).strip().lower(): c for c in df.columns}
+    normalized = {_norm_header(c): c for c in df.columns}
     for candidate in candidates:
-        if candidate in normalized:
-            return normalized[candidate]
+        key = _norm_header(candidate)
+        if key in normalized:
+            return normalized[key]
     return None
 
 
-def _load_county_sale_events(files) -> tuple[dict[str, dict], list[str]]:
-    events: dict[str, dict] = {}
+def _canonical_cause(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return "".join(ch for ch in str(value).upper().strip() if ch.isalnum())
+
+
+def _read_county_report(raw: bytes) -> pd.DataFrame:
+    # County exports usually place headers on row 4, but detect them so
+    # alternate report layouts do not silently fail.
+    preview = pd.read_excel(io.BytesIO(raw), header=None, nrows=12, dtype=object, engine="openpyxl")
+    header_row = None
+    header_tokens = {
+        "sale status", "appraisal dist #", "tad account", "tad #",
+        "cause no", "cause number", "receipt #", "bidder id",
+    }
+    wanted = {_norm_header(x) for x in header_tokens}
+    for idx, row in preview.iterrows():
+        row_tokens = {_norm_header(v) for v in row.tolist() if v not in (None, "")}
+        if row_tokens & wanted:
+            header_row = idx
+            break
+    if header_row is None:
+        header_row = 3
+    return pd.read_excel(io.BytesIO(raw), header=header_row, dtype=object, engine="openpyxl")
+
+
+def _load_county_sale_events(files) -> tuple[dict[str, dict], dict[str, dict], list[str]]:
+    events_by_account: dict[str, dict] = {}
+    events_by_cause: dict[str, dict] = {}
     errors: list[str] = []
 
     status_candidates = {"sale status", "status"}
-    account_candidates = {"appraisal dist #", "appraisal dist#", "tad account", "tad #", "tad#", "tad account number"}
-    cause_candidates = {"cause no", "cause no.", "cause #", "cause number"}
+    account_candidates = {
+        "appraisal dist #", "appraisal dist#", "appraisal district #",
+        "tad account", "tad account #", "tad #", "tad#", "tad account number",
+        "account num", "account number", "apn", "pin",
+    }
+    cause_candidates = {"cause no", "cause no.", "cause #", "cause number", "cause"}
     date_candidates = {"sale date"}
     purchaser_candidates = {"purchaser", "buyer"}
     amount_candidates = {"amount", "sale amount"}
@@ -106,14 +143,15 @@ def _load_county_sale_events(files) -> tuple[dict[str, dict], list[str]]:
     for uploaded in files or []:
         try:
             raw = uploaded.getvalue()
-            df = pd.read_excel(io.BytesIO(raw), header=3, dtype=object, engine="openpyxl")
-            df = df.dropna(how="all")
+            df = _read_county_report(raw).dropna(how="all")
             account_col = _find_column(df, account_candidates)
-            if not account_col:
+            cause_col = _find_column(df, cause_candidates)
+            # Aggregate-only reports (for example payment summaries) have no
+            # property key and are intentionally skipped.
+            if not account_col and not cause_col:
                 continue
 
             status_col = _find_column(df, status_candidates)
-            cause_col = _find_column(df, cause_candidates)
             date_col = _find_column(df, date_candidates)
             purchaser_col = _find_column(df, purchaser_candidates)
             amount_col = _find_column(df, amount_candidates)
@@ -128,8 +166,9 @@ def _load_county_sale_events(files) -> tuple[dict[str, dict], list[str]]:
                 inferred_status = "Sold"
 
             for _, row in df.iterrows():
-                account = _canonical_tad_account(row.get(account_col))
-                if not account:
+                account = _canonical_tad_account(row.get(account_col)) if account_col else ""
+                cause = _canonical_cause(row.get(cause_col)) if cause_col else ""
+                if not account and not cause:
                     continue
                 status = str(row.get(status_col, "") or "").strip() if status_col else inferred_status
                 if not status:
@@ -146,24 +185,32 @@ def _load_county_sale_events(files) -> tuple[dict[str, dict], list[str]]:
                     "source": uploaded.name,
                 }
 
-                current = events.get(account)
-                if current is None:
-                    events[account] = event
-                else:
-                    # Prefer an event with a sale date, and otherwise keep the later file
-                    # in the upload order as the most recent county status.
+                def keep_latest(store: dict[str, dict], key: str):
+                    if not key:
+                        return
+                    current = store.get(key)
+                    if current is None:
+                        store[key] = event
+                        return
                     cur_date = pd.to_datetime(current.get("sale_date"), errors="coerce")
                     new_date = pd.to_datetime(event.get("sale_date"), errors="coerce")
                     if pd.isna(cur_date) or (not pd.isna(new_date) and new_date >= cur_date):
-                        events[account] = event
+                        store[key] = event
+
+                keep_latest(events_by_account, account)
+                keep_latest(events_by_cause, cause)
         except Exception as exc:
             errors.append(f"{uploaded.name}: {exc}")
 
-    return events, errors
+    return events_by_account, events_by_cause, errors
 
 
-def _apply_county_sale_status(df: pd.DataFrame, events: dict[str, dict]) -> pd.DataFrame:
-    if not events:
+def _apply_county_sale_status(
+    df: pd.DataFrame,
+    events_by_account: dict[str, dict],
+    events_by_cause: dict[str, dict],
+) -> pd.DataFrame:
+    if not events_by_account and not events_by_cause:
         return df
 
     result = df.copy()
@@ -176,17 +223,27 @@ def _apply_county_sale_status(df: pd.DataFrame, events: dict[str, dict]) -> pd.D
             result[column] = ""
 
     account_columns = [c for c in ["TAD Account Number", "Tax Account/APN", "Account_Num", "APN", "PIN"] if c in result.columns]
+    cause_columns = [c for c in result.columns if _norm_header(c) in {
+        _norm_header("Cause No"), _norm_header("Cause Number"), _norm_header("Cause #"), _norm_header("Cause")
+    }]
 
     for idx, row in result.iterrows():
-        account = ""
+        event = None
         for col in account_columns:
             account = _canonical_tad_account(row.get(col))
-            if account:
+            if account and account in events_by_account:
+                event = events_by_account[account]
                 break
-        if not account or account not in events:
-            continue
 
-        event = events[account]
+        if event is None:
+            for col in cause_columns:
+                cause = _canonical_cause(row.get(col))
+                if cause and cause in events_by_cause:
+                    event = events_by_cause[cause]
+                    break
+
+        if event is None:
+            continue
         status = str(event.get("status", "")).strip()
         status_upper = status.upper()
 
@@ -284,12 +341,16 @@ def run():
             max_upload_size=MAX_TAD_UPLOAD_MB,
             help="Upload Sold, Withdrawn, Struck Off, All Without Exceptions, Sale Receipt, or Excess Proceeds reports. Status is matched by TAD account number.",
         )
-        county_events, county_errors = _load_county_sale_events(county_files)
+        county_events, county_cause_events, county_errors = _load_county_sale_events(county_files)
         if county_errors:
             st.warning("Some county files could not be read:\n\n" + "\n".join(f"• {e}" for e in county_errors))
-        if county_events:
-            status_counts = pd.Series([e["status"] for e in county_events.values()]).value_counts()
-            st.success(f"County sale status ready: {len(county_events):,} TAD account(s) loaded.")
+        if county_events or county_cause_events:
+            unique_events = list(county_events.values())
+            status_counts = pd.Series([e["status"] for e in unique_events]).value_counts() if unique_events else pd.Series(dtype=object)
+            st.success(
+                f"County sale status ready: {len(county_events):,} TAD account(s) "
+                f"and {len(county_cause_events):,} cause number(s) indexed."
+            )
             st.caption(" • ".join(f"{status}: {count:,}" for status, count in status_counts.items()))
 
         tad_index = None
@@ -381,7 +442,7 @@ def run():
                 status.caption(f"{current:,} / {total:,} — {address[:75]} — {research_status}")
 
             enriched = core.research_dataframe(df, progress_callback=update_progress, tad_index=tad_index)
-            enriched = _apply_county_sale_status(enriched, county_events)
+            enriched = _apply_county_sale_status(enriched, county_events, county_cause_events)
             st.session_state["results"] = enriched
             st.session_state["tad_source_names"] = source_names
             progress.progress(1.0)
