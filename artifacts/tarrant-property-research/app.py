@@ -121,6 +121,12 @@ RESEARCH_COLUMNS = [
     "Scheduled Auction",
     "Later Sale Found",
     "Likely Resolved",
+    "Lead Action",
+    "County Sale Date",
+    "County Cause Number",
+    "County Purchaser",
+    "County Sale Amount",
+    "County Status Source",
     "Distress Score",
     "Research Priority",
 ]
@@ -1230,7 +1236,7 @@ def render_results(df: pd.DataFrame):
     if match_filter: filtered = filtered[filtered["Match Status"].isin(match_filter)]
     if review_only: filtered = filtered[filtered["Uncertain Match Flag"] == "YES"]
     st.caption(f"Showing {len(filtered):,} of {len(df):,} properties.")
-    priority_columns = ["Grantor/Owner","Grantor / Owner","Property Address","Property / Legal Description","Matched Address","Address Match Score","Match Status","TAD Account Number","Current Owner","Year Built","Total Assessed Value","Market Value","TAD Verified","Research Status","Missing Data Flag","Uncertain Match Flag"]
+    priority_columns = ["Grantor/Owner","Grantor / Owner","Property Address","Property / Legal Description","Matched Address","Address Match Score","Match Status","TAD Account Number","Current Owner","Year Built","Total Assessed Value","Market Value","TAD Verified","Foreclosure Status","Lead Action","Later Sale Found","Likely Resolved","County Sale Date","County Purchaser","County Sale Amount","Research Status","Missing Data Flag","Uncertain Match Flag"]
     display_columns = [c for c in priority_columns if c in filtered.columns]; st.dataframe(filtered[display_columns], use_container_width=True, hide_index=True, height=500)
     output = excel_bytes(df); st.download_button("Export enriched Excel", data=output, file_name=f"tarrant_county_property_research_{datetime.now():%Y%m%d_%H%M%S}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 
