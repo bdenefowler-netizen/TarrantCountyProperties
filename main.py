@@ -70,6 +70,153 @@ def _tad_quick_check(tad_index: BulkTADIndex, addresses: list[str]):
     return matches
 
 
+def _canonical_tad_account(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if not digits:
+        return ""
+    # County reports sometimes omit leading zeroes and sometimes append a second
+    # account in parentheses. The first account is the primary one for matching.
+    if len(digits) > 8:
+        digits = digits[:8]
+    return digits.zfill(8)
+
+
+def _find_column(df: pd.DataFrame, candidates: set[str]):
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    return None
+
+
+def _load_county_sale_events(files) -> tuple[dict[str, dict], list[str]]:
+    events: dict[str, dict] = {}
+    errors: list[str] = []
+
+    status_candidates = {"sale status", "status"}
+    account_candidates = {"appraisal dist #", "appraisal dist#", "tad account", "tad #", "tad#", "tad account number"}
+    cause_candidates = {"cause no", "cause no.", "cause #", "cause number"}
+    date_candidates = {"sale date"}
+    purchaser_candidates = {"purchaser", "buyer"}
+    amount_candidates = {"amount", "sale amount"}
+
+    for uploaded in files or []:
+        try:
+            raw = uploaded.getvalue()
+            df = pd.read_excel(raw, header=3, dtype=object, engine="openpyxl")
+            df = df.dropna(how="all")
+            account_col = _find_column(df, account_candidates)
+            if not account_col:
+                continue
+
+            status_col = _find_column(df, status_candidates)
+            cause_col = _find_column(df, cause_candidates)
+            date_col = _find_column(df, date_candidates)
+            purchaser_col = _find_column(df, purchaser_candidates)
+            amount_col = _find_column(df, amount_candidates)
+
+            inferred_status = ""
+            upper_name = uploaded.name.upper()
+            if "STRUCK OFF" in upper_name:
+                inferred_status = "Struck Off"
+            elif "WITHDRAWN" in upper_name:
+                inferred_status = "Withdrawn"
+            elif "SOLD" in upper_name or "EXCESS PROCEEDS" in upper_name or "EXCESS FUNDS" in upper_name:
+                inferred_status = "Sold"
+
+            for _, row in df.iterrows():
+                account = _canonical_tad_account(row.get(account_col))
+                if not account:
+                    continue
+                status = str(row.get(status_col, "") or "").strip() if status_col else inferred_status
+                if not status:
+                    status = inferred_status
+                if not status:
+                    continue
+
+                event = {
+                    "status": status,
+                    "sale_date": row.get(date_col, "") if date_col else "",
+                    "cause": str(row.get(cause_col, "") or "").strip() if cause_col else "",
+                    "purchaser": str(row.get(purchaser_col, "") or "").strip() if purchaser_col else "",
+                    "amount": row.get(amount_col, "") if amount_col else "",
+                    "source": uploaded.name,
+                }
+
+                current = events.get(account)
+                if current is None:
+                    events[account] = event
+                else:
+                    # Prefer an event with a sale date, and otherwise keep the later file
+                    # in the upload order as the most recent county status.
+                    cur_date = pd.to_datetime(current.get("sale_date"), errors="coerce")
+                    new_date = pd.to_datetime(event.get("sale_date"), errors="coerce")
+                    if pd.isna(cur_date) or (not pd.isna(new_date) and new_date >= cur_date):
+                        events[account] = event
+        except Exception as exc:
+            errors.append(f"{uploaded.name}: {exc}")
+
+    return events, errors
+
+
+def _apply_county_sale_status(df: pd.DataFrame, events: dict[str, dict]) -> pd.DataFrame:
+    if not events:
+        return df
+
+    result = df.copy()
+    for column in [
+        "Foreclosure Status", "Later Sale Found", "Likely Resolved", "Lead Action",
+        "County Sale Date", "County Cause Number", "County Purchaser",
+        "County Sale Amount", "County Status Source",
+    ]:
+        if column not in result.columns:
+            result[column] = ""
+
+    account_columns = [c for c in ["TAD Account Number", "Tax Account/APN", "Account_Num", "APN", "PIN"] if c in result.columns]
+
+    for idx, row in result.iterrows():
+        account = ""
+        for col in account_columns:
+            account = _canonical_tad_account(row.get(col))
+            if account:
+                break
+        if not account or account not in events:
+            continue
+
+        event = events[account]
+        status = str(event.get("status", "")).strip()
+        status_upper = status.upper()
+
+        result.at[idx, "Foreclosure Status"] = status
+        result.at[idx, "County Cause Number"] = event.get("cause", "")
+        result.at[idx, "County Purchaser"] = event.get("purchaser", "")
+        result.at[idx, "County Sale Amount"] = event.get("amount", "")
+        result.at[idx, "County Status Source"] = event.get("source", "")
+
+        sale_date = event.get("sale_date", "")
+        parsed_date = pd.to_datetime(sale_date, errors="coerce")
+        result.at[idx, "County Sale Date"] = parsed_date.date().isoformat() if not pd.isna(parsed_date) else (sale_date or "")
+
+        if "SOLD" in status_upper:
+            result.at[idx, "Later Sale Found"] = "YES"
+            result.at[idx, "Likely Resolved"] = "YES"
+            result.at[idx, "Lead Action"] = "REMOVE — SOLD"
+        elif "STRUCK OFF" in status_upper:
+            result.at[idx, "Later Sale Found"] = "NO"
+            result.at[idx, "Likely Resolved"] = "YES"
+            result.at[idx, "Lead Action"] = "STRUCK OFF — REVIEW"
+        elif "WITHDRAWN" in status_upper:
+            result.at[idx, "Later Sale Found"] = "NO"
+            result.at[idx, "Likely Resolved"] = "NO"
+            result.at[idx, "Lead Action"] = "FOLLOW UP / MONITOR"
+        else:
+            result.at[idx, "Lead Action"] = "REVIEW"
+
+    return result
+
+
 def run():
     st.title("Tarrant County Property Research")
     st.caption("v2.5 • Foreclosure cleanup • TAD match diagnostics • Split-TXT streaming • Excel export")
@@ -127,6 +274,22 @@ def run():
             max_upload_size=MAX_TAD_UPLOAD_MB,
             help=f"Select all related split ZIPs at the same time. Each individual upload may be up to {MAX_TAD_UPLOAD_MB} MB.",
         )
+
+        st.subheader("3. Add county tax-sale results (optional)")
+        county_files = st.file_uploader(
+            "County tax-sale result files",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            max_upload_size=MAX_TAD_UPLOAD_MB,
+            help="Upload Sold, Withdrawn, Struck Off, All Without Exceptions, Sale Receipt, or Excess Proceeds reports. Status is matched by TAD account number.",
+        )
+        county_events, county_errors = _load_county_sale_events(county_files)
+        if county_errors:
+            st.warning("Some county files could not be read:\n\n" + "\n".join(f"• {e}" for e in county_errors))
+        if county_events:
+            status_counts = pd.Series([e["status"] for e in county_events.values()]).value_counts()
+            st.success(f"County sale status ready: {len(county_events):,} TAD account(s) loaded.")
+            st.caption(" • ".join(f"{status}: {count:,}" for status, count in status_counts.items()))
 
         tad_index = None
         source_names: list[str] = []
@@ -217,6 +380,7 @@ def run():
                 status.caption(f"{current:,} / {total:,} — {address[:75]} — {research_status}")
 
             enriched = core.research_dataframe(df, progress_callback=update_progress, tad_index=tad_index)
+            enriched = _apply_county_sale_status(enriched, county_events)
             st.session_state["results"] = enriched
             st.session_state["tad_source_names"] = source_names
             progress.progress(1.0)
