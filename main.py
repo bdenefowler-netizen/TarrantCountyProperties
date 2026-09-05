@@ -277,7 +277,7 @@ def _apply_county_sale_status(
 
 def run():
     st.title("Tarrant County Property Research")
-    st.caption("v2.5 • Foreclosure cleanup • TAD match diagnostics • Split-TXT streaming • Excel export")
+    st.caption("v2.6 • Parcel-key TAD joins • ZIP member detection • County sale status • Excel export")
     research_tab, results_tab, help_tab, privacy_tab = st.tabs(["Research", "Results", "Help", "Privacy"])
 
     with research_tab:
@@ -321,9 +321,10 @@ def run():
 
         st.subheader("2. Add TAD property data")
         st.caption(
-            "Upload multiple TAD TXT, CSV, XLSX, or ZIP files together. Split files named like "
-            "PropertyData(Delimited).txt.part1, .part2, etc. may be spread across multiple ZIP uploads; "
-            "the app stitches them together in numeric order while streaming and preserves rows split across part boundaries."
+            "Upload PropertyData/BigBoy plus TAD companion files together. The app detects PropertyData, "
+            "Residential Comp Attribute, and Improvement Details layouts, joins them by Account_Num/PIN, "
+            "and inspects every supported member inside normal ZIP archives. Split files named like "
+            "PropertyData(Delimited).txt.part1, .part2, etc. may be spread across multiple ZIP uploads and are stitched in order."
         )
         tad_files = st.file_uploader(
             "TAD property data files",
@@ -355,6 +356,7 @@ def run():
 
         tad_index = None
         source_names: list[str] = []
+        tad_diagnostics: dict = {}
         tad_matches = []
         if tad_files:
             key = _combined_upload_key(tad_files, addresses)
@@ -362,13 +364,16 @@ def run():
             if cached and cached.get("key") == key:
                 tad_index = cached["index"]
                 source_names = cached.get("sources", [])
+                tad_diagnostics = cached.get("diagnostics", {})
             else:
                 status = st.empty()
                 progress = st.progress(0)
                 status.caption(f"Inspecting {len(tad_files)} TAD upload(s) and assembling split parts...")
                 progress.progress(0.15)
 
-                frames, source_names, errors = load_tad_uploads(tad_files, addresses, MAX_TAD_UPLOAD_MB)
+                frames, source_names, errors, tad_diagnostics = load_tad_uploads(
+                    tad_files, addresses, MAX_TAD_UPLOAD_MB
+                )
                 progress.progress(0.8)
 
                 if errors:
@@ -394,6 +399,7 @@ def run():
                     "key": key,
                     "index": tad_index,
                     "sources": source_names,
+                    "diagnostics": tad_diagnostics,
                 }
                 progress.progress(1.0)
                 progress.empty()
@@ -403,6 +409,15 @@ def run():
             st.success(
                 f"Combined TAD index ready: {len(tad_index.working):,} candidate property rows from {len(source_names):,} source group(s)."
             )
+
+            if tad_diagnostics:
+                st.caption(
+                    "TAD join diagnostics • "
+                    f"Property accounts: {tad_diagnostics.get('property_accounts', 0):,} • "
+                    f"Comp attributes joined: {tad_diagnostics.get('comp_accounts_joined', 0):,} • "
+                    f"Improvement properties joined: {tad_diagnostics.get('improvement_accounts_joined', 0):,} • "
+                    f"Improvement detail rows used: {tad_diagnostics.get('improvement_rows_joined', 0):,}"
+                )
 
             if tad_matches:
                 st.success(
@@ -465,13 +480,13 @@ def run():
             """
 1. Upload the foreclosure/distress `.xlsx` file. County report headers, footers, blank rows, and repeated column headings are removed automatically.
 2. Select **all** TAD files you want to use at the same time: `.txt`, `.csv`, `.xlsx`, and/or `.zip`.
-3. For split county files, upload **every ZIP containing the related `.txt.partN` pieces together**.
-4. The app sorts split parts numerically, stitches rows across part boundaries, filters to candidate lead addresses, and builds one TAD index.
-5. Check the **TAD quick-check** before starting research. If it says zero matches, stop there rather than producing an empty export.
-6. Regular TAD ZIP/TXT/CSV/XLSX files are still supported and can be combined with the split dataset.
-7. Start research, review uncertain matches, then export the enriched workbook.
+3. **PropertyData / BigBoy is the master parcel table.** Residential Comp Attribute rows are joined by `PIN ↔ Account_Num`.
+4. Improvement Details rows are also joined by `PIN ↔ Account_Num` and multiple improvement rows are aggregated for each parcel.
+5. Normal ZIP archives are inspected member-by-member; the app no longer silently chooses only the largest file.
+6. For split PropertyData files, upload **every ZIP containing the related `.txt.partN` pieces together**. The app stitches them in numeric order.
+7. Check the **TAD quick-check** and the new **TAD join diagnostics** before starting research, then export the enriched workbook.
 
-Adding multiple files does **not** intentionally overwrite the prior source. All files selected in the uploader are combined for that research run.
+Adding multiple files does **not** intentionally overwrite the prior source. PropertyData is preserved as the master record and companion data fills/enriches that parcel record.
 
 The importer recognizes TAD account identifiers such as `Account_Num`, `Account Number`, `APN`, and `PIN`, plus common situs-address column variations.
 
