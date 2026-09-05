@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import sys
 from pathlib import Path
@@ -105,7 +106,7 @@ def _load_county_sale_events(files) -> tuple[dict[str, dict], list[str]]:
     for uploaded in files or []:
         try:
             raw = uploaded.getvalue()
-            df = pd.read_excel(raw, header=3, dtype=object, engine="openpyxl")
+            df = pd.read_excel(io.BytesIO(raw), header=3, dtype=object, engine="openpyxl")
             df = df.dropna(how="all")
             account_col = _find_column(df, account_candidates)
             if not account_col:
