@@ -6,6 +6,7 @@
   },
   "deploy": {
     "runtime": "V2",
+    "startCommand": "streamlit run app.py --server.port $PORT --server.address 0.0.0.0",
     "numReplicas": 1,
     "sleepApplication": false,
     "useLegacyStacker": false,
