@@ -80,6 +80,7 @@ def run():
         lead_file = st.file_uploader(
             "Property / foreclosure workbook",
             type=["xlsx"],
+            max_upload_size=MAX_TAD_UPLOAD_MB,
             help="Uses the original county columns or the cleaned workbook aliases.",
         )
         if not lead_file:
@@ -123,6 +124,7 @@ def run():
             "TAD property data files",
             type=["zip", "txt", "csv", "xlsx"],
             accept_multiple_files=True,
+            max_upload_size=MAX_TAD_UPLOAD_MB,
             help=f"Select all related split ZIPs at the same time. Each individual upload may be up to {MAX_TAD_UPLOAD_MB} MB.",
         )
 
