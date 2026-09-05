@@ -27,7 +27,7 @@ from rapidfuzz import fuzz, process
 # ============================================================
 
 APP_TITLE = "Tarrant County Property Research"
-MAX_UPLOAD_MB = 25
+MAX_UPLOAD_MB = 200
 REQUEST_TIMEOUT = 20
 APP_VERSION = "2.0"
 TAD_PROPERTY_PDF_TEMPLATE = "https://www.tad.org/export/property-pdf?account={account}"
