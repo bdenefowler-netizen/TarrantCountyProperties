@@ -1,6 +1,6 @@
-streamlit
-pandas
-psycopg2-binary
-openpyxl
-rapidfuzz
-requests
+streamlit==1.63.0
+pandas==3.0.5
+psycopg2-binary==2.9.12
+openpyxl==3.1.5
+rapidfuzz==3.14.6
+requests==2.34.2
