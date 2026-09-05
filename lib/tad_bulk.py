@@ -9,14 +9,19 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 TAD_BULK_COLUMNS = [
-    "Appraisal_Year", "Account_Num", "Owner_Name", "Owner_Address",
-    "Owner_CityState", "Owner_Zip", "Situs_Address", "Property_Class",
-    "State_Use_Code", "LegalDescription", "Deed_Date", "Land_Value",
+    "RP", "Appraisal_Year", "Account_Num", "Record_Type", "Sequence_No", "PIDN",
+    "Owner_Name", "Owner_Address", "Owner_CityState", "Owner_Zip", "Owner_Zip4",
+    "Owner_CRRT", "Situs_Address", "Property_Class", "TAD_Map", "MAPSCO",
+    "Exemption_Code", "State_Use_Code", "LegalDescription", "Notice_Date",
+    "County", "City", "School", "Num_Special_Dist", "Spec1", "Spec2", "Spec3",
+    "Spec4", "Spec5", "Deed_Date", "Deed_Book", "Deed_Page", "Land_Value",
     "Improvement_Value", "Total_Value", "Garage_Capacity", "Num_Bedrooms",
     "Num_Bathrooms", "Year_Built", "Living_Area", "Swimming_Pool_Ind",
-    "Land_Acres", "Land_SqFt", "Central_Heat_Ind", "Central_Air_Ind",
-    "Structure_Count", "Appraised_Value", "Instrument_No",
-    "Gross_Building_Area",
+    "ARB_Indicator", "Ag_Code", "Land_Acres", "Land_SqFt", "Ag_Acres",
+    "Ag_Value", "Central_Heat_Ind", "Central_Air_Ind", "Structure_Count",
+    "From_Accts", "Appraisal_Date", "Appraised_Value", "GIS_Link",
+    "Instrument_No", "Overlap_Flag", "Gross_Building_Area",
+    "Total_Net_Rentable_Area",
 ]
 
 
@@ -24,7 +29,11 @@ def canonical_account(value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
     digits = re.sub(r"\D", "", str(value))
-    return digits.zfill(8) if digits else ""
+    if not digits:
+        return ""
+    if len(digits) > 8:
+        digits = digits[:8]
+    return digits.zfill(8)
 
 
 def normalize_address(value: Any) -> str:
@@ -364,6 +373,7 @@ def map_record(record: dict[str, Any], pdf_template: str) -> dict[str, Any]:
         "TAD Owner Mailing Address": owner_mail,
         "Land Use Code": _first(record, "State_Use_Code", "State Use Code"),
         "Land Use Category": _first(record, "Property_Class", "Property Class", "Improvement Type", "Style"),
+        "Exemptions": _first(record, "Exemption_Code", "Exemption Code"),
         "Legal Description": _first(record, "LegalDescription", "Legal Description"),
         "TAD Deed Date": _first(record, "Deed_Date", "Deed Date"),
         "Latest Recording Date": _first(record, "Deed_Date", "Deed Date"),
@@ -378,7 +388,8 @@ def map_record(record: dict[str, Any], pdf_template: str) -> dict[str, Any]:
         "Bathrooms": _first(record, "Num_Bathrooms", "Bathrooms"),
         "Year Built": _first(record, "Year_Built", "Actual Year Built", "Year Built"),
         "Year Updated": _first(record, "Effective Year Built", "Effective_Year_Built"),
-        "Total Structure Area": parse_money(_first(record, "Living_Area", "Main Area", "Gross_Building_Area", "Gross Building Area")),
+        "Total Structure Area": parse_money(_first(record, "Living_Area", "Main Area", "Gross_Building_Area", "Gross Building Area", "Total_Net_Rentable_Area", "Total Net Rentable Area")),
+        "Stories": _first(record, "Stories", "Story", "Story Height"),
         "Pool": yes_no(_first(record, "Swimming_Pool_Ind", "Pool", "Pool Indicator")),
         "Lot Acres": _first(record, "Land_Acres", "Land Acres", "Acreage"),
         "Lot Area Sq Ft": parse_money(_first(record, "Land_SqFt", "Land Sq Ft", "Land Area")),
@@ -387,10 +398,11 @@ def map_record(record: dict[str, Any], pdf_template: str) -> dict[str, Any]:
         "Units": _first(record, "Structure_Count", "Structure Count"),
         "Structure Quality": _first(record, "Quality"),
         "Structure Condition": _first(record, "Condition"),
-        "Current Tax Year": _first(record, "Appraisal_Year", "Appraisal Year"),
+        "Improvements": _first(record, "Improvement Details", "Improvements"),
+        "Current Tax Year": _first(record, "Appraisal_Year", "Appraisal Year", "Tax Year", "TaxYear"),
         "TAD Verified": "YES" if account else "REVIEW",
         "TAD Property URL": pdf_template.format(account=account) if account else "",
-        "County": "Tarrant",
+        "County": _first(record, "County") or "Tarrant",
     }
     return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
